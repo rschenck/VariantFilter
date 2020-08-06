@@ -1399,59 +1399,6 @@ class DragenSample:
                     newHeader+=line+'\n'
         self.SNVSHeadout = newHeader
 
-    def _filterRawGermlineVariant(self, Options, theFlags):
-        vafs = []
-        candidates = 0
-        checks = {'^':0, '`':0, '&':0, '!':0, ';':0}
-        self.rawGermLineFlags = ['' for i in range(0,len(self.rawGermMuts))]
-        for i, line in enumerate(self.rawGermMuts):
-            # if 'PASS' == line.split('\t')[6]:
-            line = line.split('\t')
-
-            # Filter multiple events at same loci
-            if len(line[4].split(','))>1:
-                self.rawGermLineFlags[i] += '^'
-                checks['^'] += 1
-            field = line[9].split(':')
-            # Filter depth less than
-            if int(field[3])<Options.minnr:
-                self.rawGermLineFlags[i] += '`'
-                checks['`'] += 1
-            # Filter Variant Depth
-            if int(field[5].split(',')[1]) < 2:
-                self.rawGermLineFlags[i] += '&'
-                checks['&'] += 1
-            elif int(field[6].split(',')[1]) < 2 or int(field[6].split(',')[1]) < 2:
-                self.rawGermLineFlags[i] += '&'
-                checks['&'] += 1
-            else:
-                pass
-            if int(field[3]) > 0:
-                if int(field[5].split(',')[1])/float(field[3]) < 0.1:
-                    self.rawGermLineFlags[i] += '!'
-                    checks['!'] += 1
-
-            # check clustered event Options.clusterFlank
-            if ClusterMutCount(int(line[1]), self.chromsPosGerm[line[0]], Options) > 0:
-                self.rawGermLineFlags[i] += ';'
-                checks[';'] += 1
-
-            # Total candidates
-            if self.rawGermLineFlags[i]=='':
-                candidates += 1
-                vaf = int(field[5].split(',')[1])/float(field[3])
-                vafs.append(vaf)
-                self.filteredGermMuts.append('\t'.join(line))
-
-        if Options.verbose:
-            for item in checks:
-                if checks[item] > 0:
-                    logging.info('%s: %s (%.1f%%)'%(theFlags[item], checks[item], checks[item]/float(len(self.rawGermMuts))*100))
-
-            logging.info('Mean VAF: %.2f ;  Min VAF: %.2f ; Max VAF: %.2f'%( sum(vafs)/float(len(vafs)) , min(vafs), max(vafs)))
-
-            logging.info("Total candidate germline mutations: %s"%(candidates))
-
     def _filterRawSomaticSNVs(self, Options, theFlags):
         vafs = []
         candidates = 0
@@ -1506,7 +1453,10 @@ class DragenSample:
 
             # Filter for VAF check
             if float(tumorVals['DP']) > 0:
-                vaf = int(tumorVals['AD'].split(',')[1])/float(int(tumorVals['AD'].split(',')[1])+int(tumorVals['AD'].split(',')[0]))
+                try:
+                    vaf = int(tumorVals['AD'].split(',')[1])/float(int(tumorVals['AD'].split(',')[1])+int(tumorVals['AD'].split(',')[0]))
+                except ZeroDivisionError:
+                    vaf=0.0
                 if vaf < Options.minvaf:
                     self.rawSNVSflags[i] += '!'
                     checks['!'] += 1
@@ -1589,8 +1539,6 @@ class DragenMain:
         # Step 2: Read in all of the information for the files and setup classes
         self._setupSample(Options, theFlags)
 
-        sys.exit("Done Here")
-
         # # Step 3: Perform Further Germline filtering...
         # self._germlineFilterPart2(Options, theFlags)
         #
@@ -1634,7 +1582,9 @@ class DragenMain:
 
     def _setupSample(self, Options, theFlags):
         for sam in self.theSamples:
-            self.allSampleClasses.append(DragenSample(Options, theFlags, sam))
+            samClass = DragenSample(Options, theFlags, sam)
+            self._Strelka2WriteVCFFile(Options, samClass)
+            samClass = None
 
     def _germlineFilterPart2(self, Options, theFlags):
         if Options.usesamplemap:
@@ -1827,43 +1777,42 @@ class DragenMain:
         logging.info('...')
         logging.info('...')
 
-    def _Strelka2WriteVCFFile(self, Options):
+    def _Strelka2WriteVCFFile(self, Options, dragenSample):
         fullFail = ['@', '*', '&', '!', '^', '`', ';']  # All except '?'
-        for i in range(0,len(self.allSampleClasses)):
-            filtered = 0
-            accepted = 0
-            germflag = 0
-            lowevsAccepted = 0
-            finalaccepted = 0
-            finalMutsToWrite = []
-            for k,m in enumerate(self.allSampleClasses[i].rawSNVS):
-                flagIDs = self.allSampleClasses[i].rawSNVSflags[k]
-                if any(f in flagIDs for f in fullFail) == False:
-                    if 'G' in flagIDs:
-                        germflag +=1
-                    else:
-                        accepted += 1
-                        if 'LowEVS' in m.split('\t')[6]:
-                            lowevsAccepted += 1
-                            if Options.ignoreLowEVS:
-                                finalMutsToWrite.append(m)
-                        else:
-                            finalMutsToWrite.append(m)
+        filtered = 0
+        accepted = 0
+        germflag = 0
+        lowevsAccepted = 0
+        finalaccepted = 0
+        finalMutsToWrite = []
+        for k,m in enumerate(dragenSample.rawSNVS):
+            flagIDs = dragenSample.rawSNVSflags[k]
+            if any(f in flagIDs for f in fullFail) == False:
+                if 'G' in flagIDs:
+                    germflag +=1
                 else:
-                    filtered +=1
-            logging.info('...')
-            logging.info("?:?%s total sites rejected by variant filter: %s" % (self.allSampleClasses[i].SamNam, filtered))
-            logging.info("?:?%s total sites accepted by variant filter: %s" % (self.allSampleClasses[i].SamNam, accepted))
-            logging.info("?:?%s total sites with germline evidence in accepted: %s" % (self.allSampleClasses[i].SamNam, germflag))
-            logging.info("?:?%s total sites with LowEVS flag in accepted: %s"  % (self.allSampleClasses[i].SamNam, lowevsAccepted))
-            logging.info("?:?%s total SNVs/Indels: %s" % (self.allSampleClasses[i].SamNam, len(finalMutsToWrite)))
-            logging.info('...')
+                    accepted += 1
+                    if 'LowEVS' in m.split('\t')[6]:
+                        lowevsAccepted += 1
+                        if Options.ignoreLowEVS:
+                            finalMutsToWrite.append(m)
+                    else:
+                        finalMutsToWrite.append(m)
+            else:
+                filtered +=1
+        logging.info('...')
+        logging.info("?:?%s total sites rejected by variant filter: %s" % (dragenSample.SamNam, filtered))
+        logging.info("?:?%s total sites accepted by variant filter: %s" % (dragenSample.SamNam, accepted))
+        logging.info("?:?%s total sites with germline evidence in accepted: %s" % (dragenSample.SamNam, germflag))
+        logging.info("?:?%s total sites with LowEVS flag in accepted: %s"  % (dragenSample.SamNam, lowevsAccepted))
+        logging.info("?:?%s total SNVs/Indels: %s" % (dragenSample.SamNam, len(finalMutsToWrite)))
+        logging.info('...')
 
-            outputName = Options.inDir + self.allSampleClasses[i].SamNam + '.variantfilter.vcf'
-            with open(outputName, 'w') as outFile:
-                outFile.write(self.allSampleClasses[i].SNVSHeadout)
-                for m in finalMutsToWrite:
-                    outFile.write(m + '\n')
+        outputName = dragenSample.SamNam.replace('.vcf.gz','.variantfilter.vcf')
+        with open(outputName, 'w') as outFile:
+            outFile.write(dragenSample.SNVSHeadout)
+            for m in finalMutsToWrite:
+                outFile.write(m + '\n')
 
     def _strelka2_AnnotateVCFFiles(self, inputpath, samname, Options):
         inputName = Options.inDir + samname + '.variantfilter.vcf'
