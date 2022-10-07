@@ -15,12 +15,11 @@ import glob
 import subprocess
 import gzip
 import pysam
+
 try:
     from pyfiglet import Figlet
 except:
     pass
-
-
 
 def VariantFilterBanner():
     try:
@@ -34,6 +33,8 @@ def Parser():
     # get user variables
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", dest="inDir", default='./', type=str, help="Input directory of vcf files with .passed.vcf extension, in the case of Strelka2 it expects the directory containing all information. Default: ./")
+    parser.add_argument("--concensus", dest="concensus", default=False, action="store_true", help="Whether to get a concensus call or not. If flag is present the assumed file to keep is the MuTect2 calls. Default=False")
+    parser.add_argument("--inDirConcensus", dest="inDirConcensus", default="./??", help="Directory to look for calls made from secondary caller (supports Strelka2 only). Must be present if --concensus is True.")
     parser.add_argument("-c", dest="caller", default=1, type=int, help="Callers to be used, 1) MuTect2 2) Strelka2 3) Octopus 4) Shearwater ML; Default: 1) MuTect2")
     parser.add_argument("-ievs", dest="ignoreLowEVS", default=False, action="store_true", help="Whether to ignore the LowEVS filter on Strelka2 output. Default=False. (Only applies for Strelka2 caller)")
     parser.add_argument("-nr", dest="minnr", default=10, type=int, help="Minimum reads in normal. Default: 10")
@@ -54,7 +55,7 @@ def Parser():
     parser.add_argument("-reffasta", dest="refgenome", default='/well/leedham/users/rschenck/References/Ensembl/GRCm38/Mus_musculus.GRCm38.dna.primary_assembly.fa', type=str, help="Reference genome that the variants are called with. Default=/well/leedham/users/rschenck/References/Ensembl/GRCm38/Mus_musculus.GRCm38.dna.primary_assembly.fa")
     Options = parser.parse_args()
     # Run options tests
-    if Options.inDir[-1] is not '/':
+    if Options.inDir[-1] != '/':
         Options.inDir += '/'
     if os.path.isdir(Options.inDir)==False:
         logging.error("Unable to locate input directory. Please check -i option.")
@@ -85,6 +86,11 @@ def Parser():
         if os.path.exists(Options.jarfile)==False or Options.ref is None:
             logging.error("If -a is specified a jarfile (-j) and reference (-ref) for snpEff must be used.")
             sys.exit()
+    if Options.concensus:
+        if Options.inDirConcensus == "./??":
+            logging.error("No directory provided for concensus filtering.")
+        if Options.inDirConcensus[-1] != '/':
+            Options.inDirConcensus += '/'
     logging.info("Beginning...")
     return(Options)
 
@@ -116,7 +122,7 @@ class MuTect2Sample:
         # Step 1: Read in muts and get tumor and normal column indices
         self.normal_col = None
         self.tumor_col = None
-        self.header,self.rawmuts = self._ParseFileAndBuildHeader(Options)
+        self.header,self.rawmuts,self.tumorcolname = self._ParseFileAndBuildHeader(Options)
         # Step 1a: Get positions for cluster events
         self.chromsPos = PrepareClusteredEventCheck(self.rawmuts)
 
@@ -136,7 +142,8 @@ class MuTect2Sample:
         argparsevars = {'minnr': '-nr', 'minvr': '-vr', 'minvaf': '-af', 'clusterFlank': '-l', 'table': '-t',
                         'inDir': '-i', 'caller': '-c', 'usesamplemap': '--usesamplemap', 'samplemap': '--samplemap',
                         'uminvr': '-uvr', 'uminvaf': '-uaf', 'verbose': '-v', 'maxevents':'-e', 'varsamdepth':'-vd',
-                        'ann':'-a', 'ref':'-ref','jarfile':'-jar', 'refgenome':'-reffasta', 'ignoreLowEVS':'-ievs'}
+                        'ann':'-a', 'ref':'-ref','jarfile':'-jar', 'refgenome':'-reffasta', 'ignoreLowEVS':'-ievs', 'concensus':'--concensus',
+                        'inDirConcensus':'--inDirConcensus'}
         commandLine = 'FilterVariants.py ' + ' '.join([' '.join([argparsevars[arg], str(getattr(Options, arg))]) for arg in vars(Options)])
         outline = '##FilterVariants=<ID=FilterVariants,CommandLine="%s">'%(commandLine)
         newHeader = ''
@@ -163,7 +170,7 @@ class MuTect2Sample:
         self.normal_col = chromline.index(normcolumn)
         self.tumor_col = chromline.index(tumorcolumn)
 
-        return(newHeader, rawMuts)
+        return(newHeader, rawMuts, tumorcolumn)
 
     def _normalcheck(self, Options):
         normalchecks = {'@':0,'?':0,'*':0,'^':0}
@@ -190,7 +197,11 @@ class MuTect2Sample:
                     logging.info('%s: %s (%.1f%%)'%(self.flagentries[item], normalchecks[item], normalchecks[item]/float(len(self.rawmuts))*100))
 
     def _variantcheck(self, Options):
-        variantchecks = {'&':0,'!':0,'`':0,';':0}
+        variantchecks = {'&':0,'!':0,'`':0,';':0,'=':0}
+
+        if Options.concensus:
+            snvList, indelList = self._getConcensusMuts(Options)
+
         for i,mut in enumerate(self.rawmuts):
             m = mut.split('\t')
             mvar = dict(zip(m[8].split(':'), m[self.tumor_col].split(':')))
@@ -227,11 +238,62 @@ class MuTect2Sample:
                 self.flags[i] += ';'
                 variantchecks[';'] += 1
 
+            # Check concensus
+            if Options.concensus:
+                if len(m[3])==1 and len(m[4])==1:
+                    mutId = '_'.join([m[0],m[1],m[3],m[4]])
+                    if mutId not in snvList:
+                        self.flags[i] += '='
+                        variantchecks['='] += 1
+                else: # Mut is an INDEL
+                    if len(m[3]) > len(m[4]):
+                        indelType = "del"
+                    else:
+                        indelType = "ins"
+                    mutId = '_'.join([m[0], m[1], indelType])
+                    if mutId not in indelList:
+                        self.flags[i] += '='
+                        variantchecks['='] += 1
+
         if Options.verbose:
             logging.info('Variant sample check metrics...')
             for item in variantchecks:
                 if variantchecks[item] > 0:
                     logging.info('%s: %s (%.1f%%)'%(self.flagentries[item], variantchecks[item], variantchecks[item]/float(len(self.rawmuts))*100))
+
+    def _getConcensusMuts(self, Options):
+        somSNVS = Options.inDirConcensus + self.tumorcolname + '/results/variants/somatic.snvs.vcf.gz'
+        somINDELS = Options.inDirConcensus + self.tumorcolname + '/results/variants/somatic.indels.vcf.gz'
+
+        if os.path.exists(somSNVS)!=True or os.path.exists(somINDELS)!=True:
+            logging.error("Concensus files are not found for %s"%(self.tumorcolname))
+            sys.exit()
+        if Options.verbose:
+            logging.info("Strelka2 files found.")
+
+        snvs = []
+        with gzip.open(somSNVS, 'rb') as inSom:
+            SomLines = [line.decode('UTF-8').replace('\n', '') for line in inSom.readlines()]
+        for line in SomLines:
+            if line.startswith("#")==False:
+                l = line.split('\t')
+                mutId = '_'.join([l[0],l[1],l[3],l[4]])
+                snvs.append(mutId)
+
+        indels = []
+        with gzip.open(somINDELS, 'rb') as inSomIndels:
+            SomLinesIndels = [line.decode('UTF-8').replace('\n', '') for line in inSomIndels.readlines()]
+        for line in SomLinesIndels:
+            if line.startswith("#")==False:
+                l = line.split('\t')
+                if len(l[3]) > len(l[4]) :
+                    indelType = "del"
+                else:
+                    indelType = "ins"
+                mutId = '_'.join([l[0],l[1],indelType])
+                indels.append(mutId)
+
+        return(snvs, indels)
 
     def _constructjointrefdict(self):
         '''
@@ -366,7 +428,7 @@ class MuTect2Filter:
 
     def _BuildMutect2Table(self, Options):
         if Options.ann==False:
-            fullFail = ['@','*','&','!','^','`',';']  # All except '?'
+            fullFail = ['@','*','&','!','^','`',';','=']  # All except '?'
 
             allMuts = []
             for sam in self.allMutectSamples:
@@ -1489,7 +1551,7 @@ def WriteFilteredVCFFiles(outpath, samname, header, rawmuts, flags): # Currently
     :param flags: All of the flags for each mutation
     :return: None
     '''
-    fullFail = ['@','*','&','!','^','`',';'] # All except '?'
+    fullFail = ['@','*','&','!','^','`',';','='] # All except '?'
     outputName = outpath + samname.replace("passed.vcf","passed.variantfilter.vcf")
     with open(outputName, 'w') as outFile:
         outFile.write(header)
@@ -1513,7 +1575,7 @@ def main():
     theFlags = {'@': 'Failing variant reads in normal check', '?': 'VAF > 0.05 in normal', '*': 'Failing normal reads check',
      '&': 'Failing variant supporting reads check',
      '!': 'Failing VAF < cutoff', '^': "Failing events check", '`': 'Failing variant total depth check',
-     ';': 'Failing clustered event check', 'G':"Variant called in germline"}
+     ';': 'Failing clustered event check', 'G':"Variant called in germline", "=":"Failed concensus check"}
 
     if Options.caller==1:
         inFiles = GatherMutectSamples(Options)
